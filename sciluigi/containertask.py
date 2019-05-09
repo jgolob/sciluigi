@@ -46,9 +46,15 @@ class ContainerInfo():
 
     # Location within the container for scratch work. Can be paired with a mount
     container_working_dir = None
+    # On the hosting node, where is the local scratch space (to be mounted to the container working dir)
+    node_scratch = None
     # Local Container cache location. For things like singularity that need to pull
     # And create a local container
     container_cache = None
+
+    # Shared directory to use for storing temporary logs
+    # This needs to be mounted / shared among nodes to work (PBS/SLURM)
+    temp_log_path = None
 
     # AWS specific stuff
     aws_jobRoleArn = None
@@ -59,6 +65,7 @@ class ContainerInfo():
     aws_secrets_loc = None
     aws_boto_max_tries = None
     aws_batch_job_poll_sec = None
+    aws_scratch_vol = None
 
     # PBS STUFF
     pbs_account = None
@@ -82,11 +89,14 @@ class ContainerInfo():
                  aws_batch_job_poll_sec=10,
                  aws_secrets_loc=os.path.expanduser('~/.aws'),
                  aws_boto_max_tries=10,
+                 aws_scratch_vol=None,
                  slurm_partition=None,
                  pbs_account='',
                  pbs_queue='',
                  pbs_scriptpath=None,
-                 container_working_dir='/tmp/'
+                 container_working_dir='/tmp/',
+                 node_scratch=None,
+                 temp_log_path='.'
                  ):
         self.engine = engine
         self.vcpu = vcpu
@@ -94,6 +104,9 @@ class ContainerInfo():
         self.timeout = timeout
         self.mounts = mounts
         self.container_cache = container_cache
+        self.temp_log_path = temp_log_path
+        self.container_working_dir = container_working_dir
+        self.node_scratch = node_scratch
 
         self.aws_jobRoleArn = aws_jobRoleArn
         self.aws_s3_scratch_loc = aws_s3_scratch_loc
@@ -102,6 +115,7 @@ class ContainerInfo():
         self.aws_batch_job_poll_sec = aws_batch_job_poll_sec
         self.aws_secrets_loc = aws_secrets_loc
         self.aws_boto_max_tries = aws_boto_max_tries
+        self.aws_scratch_vol = aws_scratch_vol
 
         self.slurm_partition = slurm_partition
 
@@ -187,6 +201,9 @@ class ContainerInfo():
                     config_values['aws_boto_max_tries'])
                 )
 
+        if config_values.get('aws_scratch_vol', "") != "":
+            self.aws_scratch_vol = config_values['aws_scratch_vol']
+
         if config_values.get('slurm_partition', "") != "":
             self.slurm_partition = config_values['slurm_partition']
 
@@ -201,6 +218,10 @@ class ContainerInfo():
 
         if config_values.get('container_working_dir', "") != "":
             self.container_working_dir = config_values['container_working_dir']
+        if config_values.get('node_scratch', "") != "":
+            self.node_scratch = config_values['node_scratch']
+        if config_values.get('temp_log_path', "") != "":
+            self.temp_log_path = config_values['temp_log_path']
 
     def __str__(self):
         """
@@ -529,8 +550,10 @@ class ContainerHelpers():
                 )
             )
             command_list = [
-                'singularity', 'exec', '--contain', '-e', '--scratch', self.containerinfo.container_working_dir,
+                'singularity', 'exec', '--contain', '-e',
             ]
+            if self.containerinfo.container_working_dir != '/tmp/':
+                command_list += ['--scratch', self.containerinfo.container_working_dir]
             for mp in mounts:
                 command_list += ['-B', "{}:{}:{}".format(mp, mounts[mp]['bind'], mounts[mp]['mode'])]
             command_list.append(img_location)
@@ -648,16 +671,24 @@ class ContainerHelpers():
         ))
 
         command_list = [
-            'singularity', 'exec', '--contain', '-e', '--scratch', self.containerinfo.container_working_dir,
+            'singularity', 'exec', '--contain', '-e',
         ]
+        if self.containerinfo.node_scratch is not None:
+            command_list += ['--workdir', self.containerinfo.node_scratch]
+        if self.containerinfo.container_working_dir != '/tmp/':
+            command_list += ['--scratch', self.containerinfo.container_working_dir]
         for mp in mounts:
             command_list += ['-B', "{}:{}:{}".format(mp, mounts[mp]['bind'], mounts[mp]['mode'])]
         command_list.append(img_location)
-        command_list += ['bucket_command_wrapper', '-c', command]
+        container_command_list = [
+            'bucket_command_wrapper', '-c',
+            '"{}"'.format(command.replace('"', '\"'))
+        ]
         for uf in UF:
-            command_list += ['-UF', uf]
+            container_command_list += ['-UF', uf]
         for df in DF:
-            command_list += ['-DF', df]
+            container_command_list += ['-DF', df]
+        command_list += container_command_list
 
         if not self.containerinfo.slurm_partition:  # No slurm partition. Run without slurm
             command_proc = subprocess.run(
@@ -666,10 +697,14 @@ class ContainerHelpers():
                 stderr=subprocess.PIPE,
             )
         else:
-            """
             out_fn = os.path.join(
+                self.containerinfo.temp_log_path,
                 next(tempfile._get_candidate_names())
             )
+            #command_script = "#!/bin/bash\n" + subprocess.list2cmdline(command_list) + "\n"
+
+            command_script = "#!/bin/bash\n" + " ".join(command_list) + "\n"
+
             command_proc = subprocess.run(
                 [
                     'sbatch',
@@ -678,23 +713,30 @@ class ContainerHelpers():
                     '-t', str(self.containerinfo.timeout),
                     '-p', self.containerinfo.slurm_partition,
                     '--wait',
-                    '--output={}'.format(out_fn)
+                    '--output={}'.format(out_fn),
                 ],
-                input="#!/bin/bash\n"+subprocess.list2cmdline(command_list)+"\n",
+                input=command_script,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
                 encoding='ascii'
             )
-            if command_proc.returncode == 0 and os.path.exists(out_fn):
+            if command_proc.returncode == 0:
                 log.info(
-                    open(out_fn, 'rt').read()
+                    command_proc.stdout
                 )
-            elif command_proc.returncode != 0 and os.path.exists(out_fn):
+                if os.path.exists(out_fn):
+                    log.info(open(out_fn).read())
+            elif command_proc.returncode != 0:
                 log.error(
-                    open(out_fn, 'rt').read()
+                    command_proc.stdout
                 )
+                if os.path.exists(out_fn):
+                    log.error(open(out_fn).read())
             try:
                 os.remove(out_fn)
             except:
                 pass
+
             """
             command_proc = subprocess.run(
                 [
@@ -710,6 +752,7 @@ class ContainerHelpers():
             log.info(command_proc.stdout)
             if command_proc.stderr:
                 log.warn(command_proc.stderr)
+            """
 
     def ex_aws_batch(
             self,
@@ -928,6 +971,16 @@ class ContainerHelpers():
             # To be passed along for container properties
             aws_volumes = []
             aws_mountPoints = []
+            if self.containerinfo.aws_scratch_vol is not None:
+                aws_volumes.append({
+                    'host': {'sourcePath': self.containerinfo.aws_scratch_vol},
+                    'name': 'scratch'
+                })
+                aws_mountPoints.append({
+                    'containerPath': self.containerinfo.container_working_dir,
+                    'sourceVolume': 'scratch',
+                    'readOnly': False,
+                })
             for (host_path, container_details) in self.containerinfo.mounts.items():
                 name = str(uuid.uuid5(uuid.NAMESPACE_URL, host_path))
                 aws_volumes.append({
