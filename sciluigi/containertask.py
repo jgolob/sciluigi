@@ -554,6 +554,8 @@ class ContainerHelpers():
             ]
             if self.containerinfo.container_working_dir != '/tmp/':
                 command_list += ['--scratch', self.containerinfo.container_working_dir]
+            if self.containerinfo.node_scratch is not None:
+                command_list += ['--workdir', self.containerinfo.node_scratch]                
             for mp in mounts:
                 command_list += ['-B', "{}:{}:{}".format(mp, mounts[mp]['bind'], mounts[mp]['mode'])]
             command_list.append(img_location)
